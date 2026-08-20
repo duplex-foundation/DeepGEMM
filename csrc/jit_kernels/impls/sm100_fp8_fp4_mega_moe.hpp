@@ -25,6 +25,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        bool fp8_weights;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -79,6 +80,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -96,7 +98,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.fp8_weights ? "cutlass::float_e4m3_t" : "cutlass::detail::float_e2m1_unpacksmem_t");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -150,6 +153,9 @@ static void sm100_fp8_fp4_mega_moe(
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
+    const bool fp8_weights = l1_weights.scalar_type() == torch::kFloat8_e4m3fn;
+    DG_HOST_ASSERT(fp8_weights or l1_weights.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(l2_weights.scalar_type() == l1_weights.scalar_type());
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
@@ -283,6 +289,7 @@ static void sm100_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .fp8_weights = fp8_weights,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -312,7 +319,8 @@ static void sm100_fp8_fp4_mega_moe(
     };
 
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
-    const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe", code);
+    const auto runtime = compiler->build(
+        fp8_weights ? "sm100_fp8_fp8_mega_moe" : "sm100_fp8_fp4_mega_moe", code);
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
 }
 

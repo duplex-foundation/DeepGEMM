@@ -175,6 +175,11 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math
     )
 
+# Alias for FP8-weight models (e.g. FP8 e4m3 expert weights): the C++ entry
+# dispatches on the weight tensor dtype (e4m3 -> sm100_fp8_fp8_mega_moe JIT
+# kernel, packed FP4 -> sm100_fp8_fp4_mega_moe JIT kernel).
+fp8_mega_moe = fp8_fp4_mega_moe
+
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,
