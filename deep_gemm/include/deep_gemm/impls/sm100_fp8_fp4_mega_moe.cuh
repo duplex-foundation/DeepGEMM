@@ -35,6 +35,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    typename b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -162,7 +163,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Data types
     // NOTES: activations are FP8 (e4m3), weights are FP4 (e2m1)
     using a_dtype_t = cutlass::float_e4m3_t;
-    using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
 
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
@@ -745,8 +745,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
                     tma::copy<BLOCK_N, 1, 0>(
                         tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                    // fp4 (16U4_ALIGN16B) counts packed gmem bytes; fp8 (UINT8) counts full smem bytes per CTA
+                    constexpr uint32_t kUnpackFactor = std::is_same_v<b_dtype_t, cutlass::float_e4m3_t> ? 2u : 1u;
                     if (is_leader_cta) {
-                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) * kUnpackFactor + sizeof(SharedStorage::smem_sfb[0]) * 2);
                     } else {
                         shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
