@@ -361,6 +361,68 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
 }
 
 
+// E8CC paged MQA logits: scores E8CC-coded indexer keys (68 B/token,
+// int32 [num_pages, 1088]) directly; `lut` is int32 [16] holding the
+// 64-byte e4m3 decode table lut[sel][y] = e4m3(beta_sel * (y - 7.5)).
+static torch::Tensor e8cc_paged_mqa_logits(const torch::Tensor& q,
+                                           const torch::Tensor& kv_codes,
+                                           const torch::Tensor& lut,
+                                           const torch::Tensor& weights,
+                                           const torch::Tensor& context_lens,
+                                           const torch::Tensor& block_table,
+                                           const torch::Tensor& schedule_meta,
+                                           const int& max_context_len) {
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+    const int num_sms = device_runtime->get_num_sms();
+
+    // Check Q
+    const auto [batch_size, next_n, num_heads, head_dim] = get_logical_shape<4>(q);
+    DG_HOST_ASSERT(num_heads == 32 and head_dim == 128);
+    DG_HOST_ASSERT(q.is_contiguous() and q.scalar_type() == torch::kFloat8_e4m3fn);
+
+    // Check codes: int32 [num_pages, 17 * 64]
+    const auto [num_kv_blocks, words_per_page] = get_shape<2>(kv_codes);
+    DG_HOST_ASSERT(words_per_page == 17 * 64);
+    DG_HOST_ASSERT(kv_codes.is_contiguous() and kv_codes.scalar_type() == torch::kInt);
+
+    // Check LUT
+    DG_HOST_ASSERT(lut.numel() == 16 and lut.is_contiguous() and lut.scalar_type() == torch::kInt);
+
+    // Check weights / block table / metadata / context lens
+    const auto [w_rows, w_heads] = get_shape<2>(weights);
+    DG_HOST_ASSERT(w_rows == batch_size * next_n and w_heads == num_heads);
+    DG_HOST_ASSERT(weights.stride(1) == 1 and weights.scalar_type() == torch::kFloat);
+    const auto [bt_rows, bt_cols] = get_shape<2>(block_table);
+    DG_HOST_ASSERT(bt_rows == batch_size and block_table.stride(1) == 1);
+    DG_HOST_ASSERT(block_table.scalar_type() == torch::kInt);
+    const auto [meta_rows, meta_cols] = get_shape<2>(schedule_meta);
+    DG_HOST_ASSERT(meta_rows == num_sms + 1 and meta_cols == 2);
+    DG_HOST_ASSERT(schedule_meta.is_contiguous() and schedule_meta.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(context_lens.dim() == 2);
+    const auto [cl_rows, cl_cols] = get_shape<2>(context_lens);
+    DG_HOST_ASSERT(cl_rows == batch_size and cl_cols == next_n);
+    DG_HOST_ASSERT(context_lens.is_contiguous() and context_lens.scalar_type() == torch::kInt);
+
+    // Allocate output
+    constexpr int split_kv = 256;
+    const int stride_logits_alignment = 1024 / static_cast<int>(c10::elementSize(torch::kFloat32));
+    const auto aligned_max_context_len = align(align(max_context_len, split_kv), stride_logits_alignment);
+    auto logits = torch::empty({batch_size * next_n, aligned_max_context_len},
+                               q.options().dtype(torch::kFloat32));
+    logits = logits.slice(-1, 0, max_context_len);
+
+    constexpr int splits_per_chunk = 16;
+    sm100_paged_mqa_logits(q, std::nullopt, kv_codes, kv_codes, weights, context_lens, logits,
+                           block_table, torch::Tensor(), schedule_meta,
+                           torch::kFloat32, batch_size, batch_size * next_n, next_n,
+                           num_heads, head_dim, num_kv_blocks, 64, true,
+                           false, aligned_max_context_len, static_cast<int>(block_table.stride(0)),
+                           num_sms, split_kv, splits_per_chunk,
+                           false, torch::kFloat8_e4m3fn, lut);
+    return logits;
+}
+
 // Legacy API wrappers
 static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
                                     const std::tuple<torch::Tensor, torch::Tensor>& kv,
@@ -418,6 +480,10 @@ static void register_apis(pybind11::module_& m) {
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
           py::arg("clean_logits") = true,
           py::arg("max_seqlen_k") = 0);
+    m.def("e8cc_paged_mqa_logits", &e8cc_paged_mqa_logits,
+          py::arg("q"), py::arg("kv_codes"), py::arg("lut"), py::arg("weights"),
+          py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
+          py::arg("max_context_len"));
     m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),

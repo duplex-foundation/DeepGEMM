@@ -85,7 +85,15 @@ static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
 // Sizes `MQALogitsSharedStorage` for a runtime (is_mx_sf, qk_dtype, num_heads, head_dim)
 // BLOCK_Q = 128 / num_heads keeps UMMA_N = 128 for all supported head counts
 static int get_mqa_logits_smem_size(const int& num_heads, const int& head_dim,
-                                    const bool& is_mx_sf, const at::ScalarType& qk_dtype) {
+                                    const bool& is_mx_sf, const at::ScalarType& qk_dtype,
+                                    const bool& is_e8cc = false) {
+    if (is_e8cc) {
+        DG_HOST_ASSERT(num_heads == 32 and head_dim == 128 and not is_mx_sf);
+        const int smem_size = static_cast<int>(sizeof(
+            layout::E8ccMQALogitsSharedStorage<32, 128, 4, 256, 3, 3, 4, 3>));
+        DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+        return smem_size;
+    }
     const auto get_smem_size = [&]<typename qk_dtype_t>(auto is_mx_sf_c, auto h, auto d) {
         constexpr bool kIsMXSF = decltype(is_mx_sf_c)::value;
         constexpr int H = decltype(h)::value, D = decltype(d)::value;
@@ -314,12 +322,14 @@ public:
         int num_kv_stages;
         int split_kv;
         int splits_per_chunk;
+        bool is_e8cc;
 
         int* context_lens;
         void* logits;
         int* block_table;
         int* indices;
         int* schedule_meta;
+        void* e8cc_lut;
 
         CUtensorMap tensor_map_q;
         CUtensorMap tensor_map_sf_q;
@@ -346,7 +356,7 @@ static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_paged_mqa_logits<
         {}, {},
         {}, {},
-        {}, {}, {},
+        {}, {}, {}, {},
         {}, {},
         {}, {},
         {}, {},
@@ -356,7 +366,7 @@ static void __instantiate_kernel() {{
 )", args.tokens_per_request, args.num_heads,
     args.head_dim, args.page_kv,
     args.is_mx_sf ? "true" : "false",
-    args.is_context_lens_2d, args.is_varlen ? "true" : "false",
+    args.is_context_lens_2d, args.is_varlen ? "true" : "false", args.is_e8cc ? "true" : "false",
     args.num_q_stages, args.num_kv_stages,
     args.split_kv, args.splits_per_chunk,
     args.num_specialized_threads, args.num_math_threads,
@@ -371,6 +381,7 @@ static void __instantiate_kernel() {{
             args.logits_stride, args.block_table_stride,
             args.context_lens, args.logits,
             args.block_table, args.indices, args.schedule_meta,
+            args.e8cc_lut,
             args.tensor_map_q, args.tensor_map_sf_q,
             args.tensor_map_kv, args.tensor_map_sf_kv,
             args.tensor_map_weights
@@ -401,16 +412,22 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
                                    const int& split_kv,
                                    const int& splits_per_chunk,
                                    const bool& is_mx_sf,
-                                   const at::ScalarType& qk_dtype) {
+                                   const at::ScalarType& qk_dtype,
+                                   const std::optional<torch::Tensor>& e8cc_lut = std::nullopt) {
     const bool is_fp4 = qk_dtype == kPackedFP4;
+    const bool is_e8cc = e8cc_lut.has_value();
+    // The E8CC kernel snapshots per-request context lens into smem
+    // (kMaxSchedRequests cap in E8ccMQALogitsSharedStorage)
+    if (is_e8cc)
+        DG_HOST_ASSERT(num_requests <= 1024);
 
     const int num_specialized_threads = 128;
     const int num_math_threads = 2 * 128;
     DG_HOST_ASSERT(split_kv == 256 and logits_stride % split_kv == 0);
 
     const int num_q_stages = 3;
-    // Match contiguous-KV pipeline depth.
-    const int num_kv_stages = is_fp4 ? 10 : 5;
+    // Match contiguous-KV pipeline depth; E8CC swaps depth for a raw-code ring.
+    const int num_kv_stages = is_e8cc ? 3 : (is_fp4 ? 10 : 5);
     // BLOCK_Q = 128 / num_heads; a Q-block holds up to BLOCK_Q request tokens
     DG_HOST_ASSERT(128 % num_heads == 0);
     const int block_q = 128 / num_heads;
@@ -427,14 +444,28 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
                                     head_dim, block_q * num_heads,
                                     static_cast<int>(q.stride(2)),
                                     swizzle_mode, 0, false, not is_fp4);
-    tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, page_kv, num_kv_blocks,
-                                     head_dim, page_kv, 1,
-                                     static_cast<int>(kv_cache.stride(1)),
-                                     static_cast<int>(kv_cache.stride(0)),
-                                     swizzle_mode, 0, false, not is_fp4);
-    tensor_map_sf_kv = make_tma_2d_desc(kv_cache_sf, page_kv, num_kv_blocks,
-                                        page_kv, 1,
-                                        static_cast<int>(kv_cache_sf.stride(0)), 0);
+    if (is_e8cc) {
+        // Raw E8CC page codes: 4352 B/page as [num_pages, 34, 32] int32
+        DG_HOST_ASSERT(page_kv == 64 and head_dim == 128 and not is_mx_sf and not is_fp4);
+        const auto codes_i32 = torch::from_blob(
+            kv_cache.data_ptr(), {num_kv_blocks, 34, 32}, {1088, 32, 1},
+            torch::TensorOptions().dtype(torch::kInt).device(kv_cache.device()));
+        tensor_map_kv = make_tma_3d_desc(codes_i32, 32, 34, num_kv_blocks,
+                                         32, 34, 1, 32, 1088, 0);
+    } else {
+        tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, page_kv, num_kv_blocks,
+                                         head_dim, page_kv, 1,
+                                         static_cast<int>(kv_cache.stride(1)),
+                                         static_cast<int>(kv_cache.stride(0)),
+                                         swizzle_mode, 0, false, not is_fp4);
+    }
+    if (is_e8cc) {
+        tensor_map_sf_kv = tensor_map_kv;  // unused by E8CC
+    } else {
+        tensor_map_sf_kv = make_tma_2d_desc(kv_cache_sf, page_kv, num_kv_blocks,
+                                            page_kv, 1,
+                                            static_cast<int>(kv_cache_sf.stride(0)), 0);
+    }
     if (is_mx_sf) {
         tensor_map_sf_q = make_tma_2d_desc(sf_q.value(), num_heads, num_requests * tokens_per_request,
                                            num_heads, block_q,
@@ -446,7 +477,7 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
                                                      num_heads, block_q,
                                                      static_cast<int>(weights.stride(0)), 0);
 
-    const int smem_size = get_mqa_logits_smem_size(num_heads, head_dim, is_mx_sf, qk_dtype);
+    const int smem_size = get_mqa_logits_smem_size(num_heads, head_dim, is_mx_sf, qk_dtype, is_e8cc);
 
     const SM100PagedMQALogitsRuntime::Args args = {
         .num_q_tokens_total = num_q_tokens_total,
@@ -463,11 +494,13 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
         .num_kv_stages = num_kv_stages,
         .split_kv = split_kv,
         .splits_per_chunk = splits_per_chunk,
+        .is_e8cc = is_e8cc,
         .context_lens = context_lens.data_ptr<int>(),
         .logits = logits.data_ptr(),
         .block_table = block_table.data_ptr<int>(),
         .indices = is_varlen ? indices.data_ptr<int>() : nullptr,
         .schedule_meta = schedule_meta.data_ptr<int>(),
+        .e8cc_lut = is_e8cc ? e8cc_lut.value().data_ptr() : nullptr,
         .tensor_map_q = tensor_map_q,
         .tensor_map_sf_q = tensor_map_sf_q,
         .tensor_map_kv = tensor_map_kv,

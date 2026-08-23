@@ -48,6 +48,19 @@ struct RequestInfo {
         return info;
     }
 
+    // Geometry from an externally provided context length (smem schedule
+    // snapshot path; non-varlen only)
+    CUTLASS_DEVICE static RequestInfo from_len(const uint32_t& q_token_idx,
+                                               const uint32_t& context_len) {
+        RequestInfo info;
+        info.q_token_start = q_token_idx;
+        info.num_q_tokens = kNextN;
+        info.num_q_blocks = math::ceil_div(info.num_q_tokens, BLOCK_Q);
+        info.num_kv_splits = math::ceil_div(context_len, SPLIT_KV);
+        info.num_kv_pages = math::ceil_div(context_len, PAGE_KV);
+        return info;
+    }
+
     // Average q-token partition across Q-blocks; returns both offset and count
     CUTLASS_DEVICE void get_q_block_span(const uint32_t& q, uint32_t& token_offset, uint32_t& num_tokens) const {
         const uint32_t base = num_q_tokens / num_q_blocks, rem = num_q_tokens % num_q_blocks;
@@ -202,6 +215,10 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
     uint32_t cur_num_block_tokens;      // valid tokens in this Q-block
     uint32_t cur_request_num_kv_pages;  // ceil(context_len / PAGE_KV); bound for last partial split
 
+    // Optional smem schedule snapshot (E8CC): consistent across all warps
+    const uint32_t* lens_snapshot;
+    uint32_t snapshot_first;
+
     CUTLASS_DEVICE const uint32_t* get_indices() const {
         if constexpr (kIsVarlen)
             return this->indices;
@@ -214,7 +231,8 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
                                                 const uint32_t* indices,
                                                 const uint32_t* block_table,
                                                 const uint32_t& block_table_stride,
-                                                const uint32_t& num_q_tokens_total) {
+                                                const uint32_t& num_q_tokens_total,
+                                                const uint32_t* sched_snapshot = nullptr) {
         this->context_lens = context_lens;
         this->block_table = block_table;
         this->block_table_stride = block_table_stride;
@@ -222,8 +240,18 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
         if constexpr (kIsVarlen)
             this->indices = indices;
 
-        const auto start = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx];
-        const auto end = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx + 1];
+        lens_snapshot = nullptr;
+        snapshot_first = 0;
+        uint2 start, end;
+        if (sched_snapshot != nullptr) {
+            start = {sched_snapshot[0], sched_snapshot[1]};
+            end = {sched_snapshot[2], sched_snapshot[3]};
+            snapshot_first = sched_snapshot[4];
+            lens_snapshot = sched_snapshot + 5;
+        } else {
+            start = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx];
+            end = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx + 1];
+        }
         end_q_token_idx = end.x;
         end_kv_split_idx = end.y;
 
@@ -232,7 +260,7 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
         done = (start.x >= num_q_tokens_total) or
                (start.x == end_q_token_idx and start.y >= end_kv_split_idx);
         if (not done)
-            cur = Info::from_q_token(start.x, num_q_tokens_total, context_lens, get_indices());
+            cur = make_info(start.x);
 
         cur_block_table_row = 0;
         cur_q_block_token_base = 0;
@@ -243,6 +271,17 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
     // Exclusive split bound for the current request, clamped at the next SM start
     CUTLASS_DEVICE uint32_t get_cur_kv_split_upper() const {
         return (cur.q_token_start == end_q_token_idx) ? end_kv_split_idx : cur.num_kv_splits;
+    }
+
+    // Request geometry via the smem snapshot when present (all warps see
+    // one consistent copy) or the global buffers otherwise
+    CUTLASS_DEVICE Info make_info(const uint32_t& q_token_idx) const {
+        if constexpr (not kIsVarlen) {
+            if (lens_snapshot != nullptr)
+                return Info::from_len(q_token_idx,
+                                      lens_snapshot[q_token_idx / kNextN - snapshot_first]);
+        }
+        return Info::from_q_token(q_token_idx, num_q_tokens_total, context_lens, get_indices());
     }
 
     // Emit the next (Q-block, chunk) task and stash its addressing geometry
@@ -280,7 +319,7 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
                     if (next_q_token >= num_q_tokens_total)
                         done = true;
                     else {
-                        cur = Info::from_q_token(next_q_token, num_q_tokens_total, context_lens, get_indices());
+                        cur = make_info(next_q_token);
                         // The new request may already be this SM's end
                         if (cur.q_token_start == end_q_token_idx and end_kv_split_idx == 0)
                             done = true;

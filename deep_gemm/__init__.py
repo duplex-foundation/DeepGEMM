@@ -66,6 +66,8 @@ try:
         # Attention kernels (legacy)
         fp8_mqa_logits,
         fp8_paged_mqa_logits,
+        # E8CC indexer scoring
+        e8cc_paged_mqa_logits,
         # Hyperconnection kernels
         tf32_hc_prenorm_gemm,
         # Layout kernels

@@ -21,6 +21,15 @@
 
 namespace deep_gemm {
 
+// Inputs for the E8CC smem schedule snapshot (empty for non-E8CC paths)
+struct E8ccSchedSnapshotArgs {
+    const uint32_t* sched_meta = nullptr;
+    const uint32_t* context_lens = nullptr;
+    uint32_t next_n = 1;
+    uint32_t ctx_lens_2d = 0;
+    uint32_t num_q_tokens_total = 0;
+};
+
 // Ring-buffer counter avoiding `% kNumStages`, which ptxas can lower poorly for TMEM paths
 template <uint32_t kNumStages>
 struct RingPipeline {
@@ -51,14 +60,16 @@ CUTLASS_DEVICE void dispatch_num_block_tokens(const uint32_t& num_block_tokens, 
 
 // Shared device core parameterized by dtype and scheduler geometry/addressing
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsMXSF, bool kIsCompressedLogits,
+          bool kIsMXSF, bool kIsCompressedLogits, bool kIsE8CC,
           uint32_t BLOCK_Q, uint32_t SPLIT_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename qk_dtype_t, typename logits_dtype_t, typename reduce_dtype_t, typename MakeScheduler,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
-CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
+CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t* e8cc_lut,
+                                               const E8ccSchedSnapshotArgs& e8cc_sched,
+                                               const uint32_t logits_stride,
                                                logits_dtype_t* logits,
                                                const cute::TmaDescriptor& tensor_map_q,
                                                const cute::TmaDescriptor& tensor_map_sf_q,
@@ -67,6 +78,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                const cute::TmaDescriptor& tensor_map_weights,
                                                const MakeScheduler& make_scheduler) {
     constexpr bool kIsFP4 = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t>;
+    constexpr bool kHasKVScale = not kIsMXSF and not kIsE8CC;
+    constexpr uint32_t kNumRawStages = 4;
+    DG_STATIC_ASSERT(not kIsE8CC or (not kIsMXSF and not kIsFP4 and kHeadDim == 128),
+                     "E8CC path is fp8 e4m3, head_dim 128 only");
 
     const auto sm_idx = blockIdx.x;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
@@ -100,8 +115,11 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
     DG_STATIC_ASSERT(SPLIT_KV == kNumMathWarpGroups * UMMA_M and SPLIT_KV % kNumUTCCPAlignedElems == 0, "Invalid `SPLIT_KV`");
 
-    using SharedStorage = layout::MQALogitsSharedStorage<kNumHeads, kHeadDim, kIsMXSF, BLOCK_Q, SPLIT_KV,
-                                                         kNumQStages, kNumKVStages, kNumTmemStages, qk_dtype_t, reduce_dtype_t>;
+    using SharedStorage = cute::conditional_t<kIsE8CC,
+        layout::E8ccMQALogitsSharedStorage<kNumHeads, kHeadDim, BLOCK_Q, SPLIT_KV,
+                                           kNumQStages, kNumKVStages, kNumRawStages, kNumTmemStages, reduce_dtype_t>,
+        layout::MQALogitsSharedStorage<kNumHeads, kHeadDim, kIsMXSF, BLOCK_Q, SPLIT_KV,
+                                       kNumQStages, kNumKVStages, kNumTmemStages, qk_dtype_t, reduce_dtype_t>>;
     extern __shared__ __align__(SharedStorage::kSwizzleAlignment) uint8_t smem_buffer[];
     auto& smem = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
@@ -119,8 +137,15 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         }
         #pragma unroll
         for (uint32_t i = 0; i < kNumKVStages; ++ i) {
-            smem.full_kv_barriers[i].init(1);
-            smem.empty_kv_barriers[i].init(kIsMXSF ? 1 : kNumMathThreads);
+            smem.full_kv_barriers[i].init(kIsE8CC ? kNumMathThreads : 1);
+            smem.empty_kv_barriers[i].init((kIsMXSF or kIsE8CC) ? 1 : kNumMathThreads);
+        }
+        if constexpr (kIsE8CC) {
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumRawStages; ++ i) {
+                smem.full_raw_barriers[i].init(1);
+                smem.empty_raw_barriers[i].init(kNumMathThreads);
+            }
         }
         #pragma unroll
         for (uint32_t i = 0; i < kNumTmemStages; ++i) {
@@ -133,12 +158,76 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
     if (warp_idx == kSpecWarpStart + 2)
         cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
+    if constexpr (kIsE8CC) {
+        if (warp_idx == kSpecWarpStart + 3) {
+            if (lane_idx < 16)
+                smem.smem_lut[lane_idx] = e8cc_lut[lane_idx];
+            // Warp-consistent schedule snapshot: every scheduler walk
+            // (loaders, UMMA, math) must see identical schedule_meta /
+            // context_lens even if an overlapped verify sub-step rewrites
+            // the global buffers mid-kernel; divergent walks deadlock the
+            // raw/kv mbarrier pipeline.  Read them once per CTA here.
+            uint32_t s_x = 0, s_y = 0, e_x = 0;
+            if (lane_idx == 0) {
+                const auto s = reinterpret_cast<const uint2*>(e8cc_sched.sched_meta)[sm_idx];
+                const auto e = reinterpret_cast<const uint2*>(e8cc_sched.sched_meta)[sm_idx + 1];
+                smem.smem_sched[0] = s.x; smem.smem_sched[1] = s.y;
+                smem.smem_sched[2] = e.x; smem.smem_sched[3] = e.y;
+                s_x = s.x; s_y = s.y; e_x = e.x;
+            }
+            s_y = __shfl_sync(0xffffffffu, s_y, 0);
+            s_x = __shfl_sync(0xffffffffu, s_x, 0);
+            e_x = __shfl_sync(0xffffffffu, e_x, 0);
+            const uint32_t total = e8cc_sched.num_q_tokens_total;
+            const uint32_t nn = e8cc_sched.next_n;
+            // Torn-rewrite tolerance: a stale value may come from a
+            // step with a different token grid, so re-align to this
+            // grid's request boundaries (duplicate work is benign)
+            const uint32_t s_al = (s_x / nn) * nn;
+            const uint32_t e_al = (e_x / nn) * nn;
+            uint32_t first = 0, span = 0;
+            if (s_al < total) {
+                first = s_al / nn;
+                // cover the whole tail: a torn end boundary can let the
+                // walk legitimately run past end.x to the last request
+                span = (total - 1) / nn - first + 1;
+                constexpr uint32_t kCap = SharedStorage::kMaxSchedRequests;
+                span = span < kCap ? span : kCap;
+            }
+            for (uint32_t r = lane_idx; r < span; r += 32) {
+                const uint32_t lens_idx = e8cc_sched.ctx_lens_2d
+                    ? (first + r) * nn + nn - 1 : (first + r);
+                smem.smem_sched[5 + r] = e8cc_sched.context_lens[lens_idx];
+            }
+            __syncwarp();
+            if (lane_idx == 0) {
+                smem.smem_sched[0] = s_al;
+                smem.smem_sched[2] = e_al;
+                smem.smem_sched[4] = first;
+                if (s_al < total) {
+                    // clamp the start split against this snapshot's own
+                    // lens: a torn s_y > splits(first) would underflow the
+                    // remaining-splits math into a ~2^32-task walk.  The
+                    // clamped 0-split task is a balanced no-op.
+                    const uint32_t splits_first =
+                        (smem.smem_sched[5] + SPLIT_KV - 1) / SPLIT_KV;
+                    if (s_y > splits_first)
+                        smem.smem_sched[1] = splits_first;
+                }
+            }
+        }
+    }
     __syncthreads();
 
     uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
 
+    const uint32_t* sched_snapshot = nullptr;
+    if constexpr (kIsE8CC)
+        sched_snapshot = smem.smem_sched;
+
     RingPipeline<kNumQStages> q_pipeline;
     RingPipeline<kNumKVStages> kv_pipeline;
+    RingPipeline<kNumRawStages> raw_pipeline;
     RingPipeline<kNumTmemStages> tmem_pipeline;
 
     constexpr uint32_t kNumSpecializedRegisters = 56;
@@ -149,7 +238,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     if (warp_idx == kSpecWarpStart) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
         if (cute::elect_one_sync()) {
-            auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end);
+            auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end, sched_snapshot);
             // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
             uint32_t q_block_idx, kv_base, num_kv_splits;
             while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
@@ -170,7 +259,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     } else if (warp_idx == kSpecWarpStart + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
-        auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end);
+        auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end, sched_snapshot);
         uint32_t cached_kv_page_base = 0;
         uint32_t cached_kv_page_coord = 0;
         // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
@@ -179,7 +268,41 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             cached_kv_page_base = cute::numeric_limits<uint32_t>::max();
             #pragma unroll 1
             for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++ kv_split_idx) {
-                if constexpr (decltype(scheduler)::kIsPaged) {
+                if constexpr (kIsE8CC and decltype(scheduler)::kIsPaged) {
+                    constexpr uint32_t kNumPagesPerSplit = decltype(scheduler)::kNumPagesPerSplit;
+                    constexpr uint32_t kRawBytesPerPage = 17 * 64 * 4;
+                    DG_STATIC_ASSERT(kNumPagesPerSplit <= 32, "Split spans more pages than a warp can cache");
+
+                    const uint32_t kv_page_base = (kv_base + kv_split_idx) * kNumPagesPerSplit;
+                    if (kv_page_base < cached_kv_page_base or kv_page_base + kNumPagesPerSplit > cached_kv_page_base + 32) {
+                        cached_kv_page_base = (kv_page_base / 32) * 32;
+                        cached_kv_page_coord = scheduler.get_kv_page_coord_by_page_offset(cached_kv_page_base + lane_idx);
+                    }
+
+                    CUTE_TIE_DECL(raw_pipeline.advance(), raw_stage_idx, raw_phase);
+                    if (cute::elect_one_sync())
+                        smem.empty_raw_barriers[raw_stage_idx].wait(raw_phase ^ 1);
+                    __syncwarp();
+
+                    int page_coords[kNumPagesPerSplit];
+                    #pragma unroll
+                    for (uint32_t page_idx = 0; page_idx < kNumPagesPerSplit; ++ page_idx) {
+                        const auto src_lane = static_cast<int>(kv_page_base - cached_kv_page_base + page_idx);
+                        page_coords[page_idx] = __shfl_sync(0xffffffff, cached_kv_page_coord, src_lane);
+                    }
+
+                    if (cute::elect_one_sync()) {
+                        #pragma unroll
+                        for (uint32_t page_idx = 0; page_idx < kNumPagesPerSplit; ++ page_idx) {
+                            tma::copy<32, kRawBytesPerPage / 128, 0, uint32_t, true>(
+                                &tensor_map_kv, &smem.full_raw_barriers[raw_stage_idx],
+                                smem.smem_raw[raw_stage_idx] + page_idx * (kRawBytesPerPage / 4),
+                                0, 0, 1, page_coords[page_idx]);
+                        }
+                        smem.full_raw_barriers[raw_stage_idx].arrive_and_expect_tx(kNumPagesPerSplit * kRawBytesPerPage);
+                    }
+                    __syncwarp();
+                } else if constexpr (decltype(scheduler)::kIsPaged) {
                     constexpr uint32_t kPageKV = decltype(scheduler)::kPageKV;
                     constexpr uint32_t kNumPagesPerSplit = decltype(scheduler)::kNumPagesPerSplit;
                     DG_STATIC_ASSERT(kNumPagesPerSplit <= 32, "Split spans more pages than a warp can cache");
@@ -247,7 +370,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
         auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
-        auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end);
+        auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end, sched_snapshot);
         // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
         uint32_t q_block_idx, kv_base, num_kv_splits;
         while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
@@ -340,7 +463,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     }
                 }
                 __syncwarp();
-                if constexpr (kIsMXSF)
+                if constexpr (kIsMXSF or kIsE8CC)
                     cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(&smem.empty_kv_barriers[kv_stage_idx]));
             }
             smem.empty_q_barriers[q_stage_idx].arrive();
@@ -377,7 +500,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             }(cute::make_index_sequence<N>{});
         };
 
-        auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end);
+        auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end, sched_snapshot);
         // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
         uint32_t q_block_idx, kv_base, num_kv_splits;
         while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
@@ -387,6 +510,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             const auto process_q_block = [&](auto num_valid_tokens_t) {
                 constexpr uint32_t kNumValidTokens = decltype(num_valid_tokens_t)::value;
 
+                // E8CC reads weights straight from SMEM in the reduce loop:
+                // the BLOCK_Q * kNumHeads register cache would push the math
+                // warpgroups past the register budget next to decode temps
+                if constexpr (not kIsE8CC) {
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
                     const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumHeads;
@@ -404,15 +531,79 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             weights[i][j] = ptx::ld_shared(smem_weights_row + j);
                     }
                 }
+                }
+
+                // E8CC: the math warpgroups decode raw codes -> fp8 e4m3
+                // in the SW128 KV stage via a 64-byte PRMT LUT, one split
+                // ahead of the UMMA consumer
+                const auto e8cc_decode_split = [&]() {
+                    if constexpr (kIsE8CC) {
+                        CUTE_TIE_DECL(raw_pipeline.advance(), raw_stage_idx, raw_phase);
+                        CUTE_TIE_DECL(kv_pipeline.advance(), dec_kv_stage_idx, dec_kv_phase);
+                        smem.full_raw_barriers[raw_stage_idx].wait(raw_phase);
+                        smem.empty_kv_barriers[dec_kv_stage_idx].wait(dec_kv_phase ^ 1);
+
+                        const uint32_t* raw = smem.smem_raw[raw_stage_idx];
+                        uint8_t* kv_u8 = reinterpret_cast<uint8_t*>(smem.smem_kv[dec_kv_stage_idx]);
+                        const uint32_t tok_group = math_thread_idx >> 3;  // 32 tokens in flight
+                        const uint32_t chunk = math_thread_idx & 7;       // 16B output chunk
+                        // 8 nibbles -> 8 e4m3 bytes: data prmt pair + msb-blend
+                        const auto dec = [&](const uint32_t& yw, const uint4& tb,
+                                             uint32_t& o0, uint32_t& o1) {
+                            const uint32_t ylo = yw & 0x77777777u;
+                            const uint32_t cm  = (yw >> 3) & 0x11111111u;
+                            const uint32_t c0 = ylo & 0xFFFFu, c1 = ylo >> 16;
+                            const uint32_t cm0 = cm & 0xFFFFu, cm1 = cm >> 16;
+                            const uint32_t lo0 = __byte_perm(tb.x, tb.y, c0);
+                            const uint32_t hi0 = __byte_perm(tb.z, tb.w, c0);
+                            const uint32_t mk0 = __byte_perm(0x0000FF00u, 0u, cm0);
+                            const uint32_t lo1 = __byte_perm(tb.x, tb.y, c1);
+                            const uint32_t hi1 = __byte_perm(tb.z, tb.w, c1);
+                            const uint32_t mk1 = __byte_perm(0x0000FF00u, 0u, cm1);
+                            o0 = (hi0 & mk0) | (lo0 & ~mk0);
+                            o1 = (hi1 & mk1) | (lo1 & ~mk1);
+                        };
+                        #pragma unroll
+                        for (uint32_t t = tok_group; t < SPLIT_KV; t += kNumMathThreads / 8) {
+                            const uint32_t page = t >> 6, off = t & 63;
+                            const uint32_t* pr = raw + page * 1088;
+                            // two adjacent y-words -> one 16B swizzled chunk
+                            const uint2 yw = *reinterpret_cast<const uint2*>(pr + (off << 4) + (chunk << 1));
+                            const uint32_t sels = pr[1024 + off] >> (chunk << 2);
+                            const uint4 tb0 = reinterpret_cast<const uint4*>(smem.smem_lut)[sels & 3];
+                            const uint4 tb1 = reinterpret_cast<const uint4*>(smem.smem_lut)[(sels >> 2) & 3];
+                            uint4 out;
+                            dec(yw.x, tb0, out.x, out.y);
+                            dec(yw.y, tb1, out.z, out.w);
+                            // SW128 swizzle: token row t, 16B chunk (chunk ^ (t%8))
+                            uint8_t* dst = kv_u8 + ((t >> 3) << 10) + ((t & 7) << 7)
+                                         + ((chunk ^ (t & 7)) << 4);
+                            *reinterpret_cast<uint4*>(dst) = out;
+                        }
+                        cutlass::arch::fence_view_async_shared();
+                        smem.empty_raw_barriers[raw_stage_idx].arrive();
+                        smem.full_kv_barriers[dec_kv_stage_idx].arrive();
+                    }
+                };
+                if constexpr (kIsE8CC) {
+                    // 0-split tasks (torn-schedule no-ops) must not consume
+                    // a raw stage the producer never issued
+                    if (num_kv_splits > 0)
+                        e8cc_decode_split();
+                }
 
                 for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++ kv_split_idx) {
+                    if constexpr (kIsE8CC) {
+                        if (kv_split_idx + 1 < num_kv_splits)
+                            e8cc_decode_split();
+                    }
                     auto kv_offset = scheduler.get_logits_col(kv_base, kv_split_idx, math_thread_idx);
 
                     // FP8 consumes the KV pipeline directly to read per-KV scales;
                     // MXFP4 / MXFP8 folds its scale into the MX SF UMMA, no extra scale
                     reduce_dtype_t scale_kv = static_cast<reduce_dtype_t>(0.0f);
                     uint32_t kv_stage_idx = 0;
-                    if constexpr (not kIsMXSF) {
+                    if constexpr (kHasKVScale) {
                         CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx_local, kv_phase);
                         kv_stage_idx = kv_stage_idx_local;
                         smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
@@ -424,7 +615,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     ptx::tcgen05_after_thread_sync();
 
                     // Release KV smem only after UMMA commits TMEM; earlier release races TMA overwrite
-                    if constexpr (not kIsMXSF)
+                    if constexpr (kHasKVScale)
                         smem.empty_kv_barriers[kv_stage_idx].arrive();
 
                     #pragma unroll
@@ -470,10 +661,16 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                         } else {
                             auto sum_0 = make_float2(0, 0);
                             auto sum_1 = make_float2(0, 0);
+                            [[maybe_unused]] const auto smem_w_row =
+                                smem.smem_weights[q_stage_idx] + i * kNumHeads;
                             const auto transform = [&](const uint32_t& j, const float2& sum) {
                                 auto a_0 = make_float2(accum[j], accum[j + 1]);
                                 auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
-                                auto b = make_float2(weights[i][j], weights[i][j + 1]);
+                                float2 b;
+                                if constexpr (kIsE8CC)
+                                    b = *reinterpret_cast<const float2*>(smem_w_row + j);
+                                else
+                                    b = make_float2(weights[i][j], weights[i][j + 1]);
                                 return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
                             };
 
@@ -486,7 +683,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             auto sum = __fadd2_rn(sum_0, sum_1);
                             reduced = (sum.x + sum.y) / 2;
                         }
-                        auto result = static_cast<logits_dtype_t>(kIsMXSF ? reduced : reduced * scale_kv);
+                        auto result = static_cast<logits_dtype_t>((kIsMXSF or kIsE8CC) ? reduced : reduced * scale_kv);
                         const auto q_offset = scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
                         if constexpr (kIsCompressedLogits) {
                             const uint32_t rel_kv = kv_offset - seq_k_start[i];
@@ -534,16 +731,17 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
-    const auto make_scheduler = [&](const uint32_t& sm_idx, uint32_t* seq_k_start, uint32_t* seq_k_end) {
+    const auto make_scheduler = [&](const uint32_t& sm_idx, uint32_t* seq_k_start, uint32_t* seq_k_end,
+                                    const uint32_t* /*sched_snapshot*/) {
         return sched::SM100MQALogitsScheduler<BLOCK_Q, SPLIT_KV, kNumSMs>(
             sm_idx, num_q_tokens, num_kv_tokens, cu_seq_len_k_start, cu_seq_len_k_end, seq_k_start, seq_k_end);
     };
 
-    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, kIsCompressedLogits, BLOCK_Q, SPLIT_KV,
+    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, kIsCompressedLogits, false, BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, kNumSMs,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
                                reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
-        logits_stride, logits,
+        nullptr, E8ccSchedSnapshotArgs{}, logits_stride, logits,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
         make_scheduler);
 }
@@ -552,7 +750,7 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
 // Paged scheduler walks (Q-block, chunk) tasks; BLOCK_Q = 128 / kNumHeads
 template <uint32_t kTokensPerRequest, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t PAGE_KV,
-          bool kIsMXSF, bool kIsContextLens2D, bool kIsVarlen,
+          bool kIsMXSF, bool kIsContextLens2D, bool kIsVarlen, bool kIsE8CC,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV, uint32_t kSplitsPerChunk,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
@@ -564,6 +762,7 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
                             const uint32_t* context_lens, logits_dtype_t* logits,
                             const uint32_t* block_table, const uint32_t* indices,
                             const uint32_t* schedule_meta,
+                            const uint32_t* e8cc_lut,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -573,19 +772,24 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
     static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
     DG_STATIC_ASSERT(SPLIT_KV == PAGE_KV * kNumPagesPerSplit, "Invalid split/page size");
 
-    const auto make_scheduler = [&](const uint32_t& sm_idx, uint32_t* /*seq_k_start*/, uint32_t* /*seq_k_end*/) {
+    DG_STATIC_ASSERT(not kIsE8CC or not kIsVarlen, "E8CC schedule snapshot is non-varlen only");
+    const auto make_scheduler = [&](const uint32_t& sm_idx, uint32_t* /*seq_k_start*/, uint32_t* /*seq_k_end*/,
+                                    const uint32_t* sched_snapshot) {
         return sched::SM100PagedMQALogitsScheduler<kTokensPerRequest, kIsContextLens2D, kIsVarlen,
                                                    kNumHeads, SPLIT_KV, PAGE_KV, kSplitsPerChunk>(
             sm_idx, context_lens, schedule_meta, indices,
-            block_table, block_table_stride, num_q_tokens_total);
+            block_table, block_table_stride, num_q_tokens_total, sched_snapshot);
     };
+    const E8ccSchedSnapshotArgs e8cc_sched = {
+        schedule_meta, context_lens,
+        kTokensPerRequest, kIsContextLens2D ? 1u : 0u, num_q_tokens_total};
 
     // Paged uses `kNumSMs = 0`; schedule meta drives the grid stride
-    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, BLOCK_Q, SPLIT_KV,
+    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, kIsE8CC, BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, 0,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
                                reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
-        logits_stride, logits,
+        e8cc_lut, e8cc_sched, logits_stride, logits,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
         make_scheduler);
 }

@@ -56,4 +56,38 @@ struct MQALogitsSharedStorage {
     uint32_t tmem_ptr_in_smem;
 };
 
+// E8CC paged MQA logits storage: fp8 Q/KV stages plus a raw-code staging
+// ring (68 B/token pages) and a 64-byte decode LUT.
+template <uint32_t kNumHeads, uint32_t kHeadDim,
+          uint32_t BLOCK_Q, uint32_t SPLIT_KV,
+          uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumRawStages,
+          uint32_t kNumTmemStages, typename reduce_dtype_t = float>
+struct E8ccMQALogitsSharedStorage {
+    using Barrier = cutlass::arch::ClusterTransactionBarrier;
+    static constexpr uint32_t kSwizzleAlignment = 8 * kHeadDim;
+    static constexpr uint32_t kRawBytesPerPage = 17 * 64 * 4;   // 4352 B
+    static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / 64;
+    static constexpr uint32_t kRawBytesPerStage = kNumPagesPerSplit * kRawBytesPerPage;
+
+    alignas(kSwizzleAlignment) cutlass::float_e4m3_t smem_q[kNumQStages][BLOCK_Q * kNumHeads * kHeadDim];
+    alignas(kSwizzleAlignment) cutlass::float_e4m3_t smem_kv[kNumKVStages][SPLIT_KV * kHeadDim];
+    alignas(128) uint32_t smem_raw[kNumRawStages][kRawBytesPerStage / 4];
+    alignas(128) reduce_dtype_t smem_weights[kNumQStages][BLOCK_Q * kNumHeads];
+    alignas(16) uint32_t smem_lut[16];
+    // Warp-consistent schedule snapshot: [0..3] this SM's schedule_meta
+    // start/end pair, [4] first spanned request id, [5..] per-request
+    // context lens for the requests this SM walks (see impl notes).
+    static constexpr uint32_t kMaxSchedRequests = 1024;
+    alignas(16) uint32_t smem_sched[5 + kMaxSchedRequests];
+    Barrier full_q_barriers[kNumQStages];
+    Barrier empty_q_barriers[kNumQStages];
+    Barrier full_kv_barriers[kNumKVStages];
+    Barrier empty_kv_barriers[kNumKVStages];
+    Barrier full_raw_barriers[kNumRawStages];
+    Barrier empty_raw_barriers[kNumRawStages];
+    Barrier full_tmem_barriers[kNumTmemStages];
+    Barrier empty_tmem_barriers[kNumTmemStages];
+    uint32_t tmem_ptr_in_smem;
+};
+
 } // namespace deep_gemm::layout
