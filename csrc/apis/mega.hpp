@@ -193,8 +193,16 @@ static void fp8_fp4_mega_moe(
         check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
         check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
-    DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4);
-    DG_HOST_ASSERT(l2_weights.scalar_type() == kPackedFP4);
+    // [fp8xfp8 host-gate port; finishes 73e1c0c] Accept native e4m3 expert
+    // weights (GLM-5.2-FP8) in addition to packed-FP4. The JIT wrapper
+    // sm100_fp8_fp4_mega_moe already dispatches on weight dtype (e4m3 ->
+    // sm100_fp8_fp8_mega_moe kernel); check_grouped_ab_fp8_fp4 handles e4m3;
+    // and the symm buffer holds activations only (fp8 in both paths), so its
+    // sizing is weight-dtype independent. These two asserts were the sole
+    // remaining fp4-only gate in the outer pybind entry.
+    const bool fp8_weights = l1_weights.scalar_type() == torch::kFloat8_e4m3fn;
+    DG_HOST_ASSERT(fp8_weights or l1_weights.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(l2_weights.scalar_type() == l1_weights.scalar_type());
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
